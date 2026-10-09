@@ -109,7 +109,7 @@ int main(void) {
 	/* USER CODE BEGIN WHILE */
 	while (1) {
 		// mover la rampa cada 20 ms
-		if ((uint32_t) (g_ms - hora_rampa) >= 20U) {
+		if ((uint32_t) (g_ms - ora_rampa) >= 20U) {
 			h_rampa += 20U; // el siguiente paso toca 20 ms después
 
 			if (subiendo == 1) {
@@ -118,7 +118,7 @@ int main(void) {
 					subiendo = 0;
 				}
 			} else {
-				duty -=- 1;               // baja un punto
+				duty -= 1;               // baja un punto
 				if (duty == 10) {
 					subiendo = 1;
 				}
@@ -128,8 +128,8 @@ int main(void) {
 		}
 
 		// LED de estado cada 500 ms
-		if ((uint32_t) (g_ms - hora_led) >= 500U) {
-			hora_led = hora_led + 500U;
+		if ((uint32_t) (g_ms - h_led) >= 500U) {
+			h_led += 500U;
 			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
 		}
 		/* USER CODE END WHILE */

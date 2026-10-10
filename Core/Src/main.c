@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,6 +35,9 @@
 #define MODO_MANUAL 0
 #define MODO_AUTO   1
 #define MODO_PAUSA  2
+
+#define RX_TAM    128   // tamano del buffer circular
+#define LINEA_MAX 63    // maximo de caracteres por linea
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,6 +71,24 @@ uint32_t ms_rampa = 0;
 uint32_t ms_led = 0;
 uint32_t evento_corta = 0;            // las pone el boton, las consume main
 uint32_t evento_larga = 0;
+
+// uart: buffer circular
+uint8_t rx_buf[RX_TAM];
+volatile uint32_t rx_head = 0;        // donde escribe la ISR
+volatile uint32_t rx_tail = 0;        // donde lee main
+uint8_t rx_byte;                      // aqui llega cada caracter
+uint32_t rx_total = 0;                // caracteres recibidos
+uint32_t rx_errores = 0;              // errores de la uart
+uint32_t rx_overflow = 0;             // veces que se lleno el buffer
+
+// uart: linea que se esta armando
+char linea[LINEA_MAX + 1];            // +1 para el '\0'
+uint32_t linea_len = 0;               // cuantos caracteres lleva
+uint32_t descartando = 0;            // 1 = linea muy larga, ignoro hasta el fin
+uint32_t err_overflow = 0;            // lineas que se pasaron de 63
+
+// comandos
+uint32_t stream_activo = 0;   // 1 = telemetria activada (todavia no manda nada)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,6 +102,13 @@ void pwm_set_duty(uint32_t duty_pct);
 void boton_actualizar(void);
 uint32_t tomar_flanco(void);
 void cambiar_modo(uint32_t nuevo);
+void entrar_pausa(void);
+void salir_pausa(void);
+uint32_t rx_leer(uint8_t *c);
+uint32_t armar_linea(uint8_t c);
+void enviar(const char *texto);
+uint32_t leer_numero(const char *s, uint32_t *valor);
+void procesar_linea(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -88,55 +117,55 @@ void cambiar_modo(uint32_t nuevo);
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
-  /* USER CODE BEGIN 1 */
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
 
-  /* USER CODE BEGIN Init */
+	/* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
+	/* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+	/* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_TIM4_Init();
-  MX_TIM2_Init();
-  MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_TIM4_Init();
+	MX_TIM2_Init();
+	MX_USART2_UART_Init();
+	/* USER CODE BEGIN 2 */
 	char saludo[] = "probando uart\r\n";
 	HAL_UART_Transmit(&huart2, (uint8_t*) saludo, sizeof(saludo) - 1, 100);
 
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 	HAL_TIM_Base_Start_IT(&htim4);
+	HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   // empieza a escuchar 1 byte
 
 	uint32_t h_tick = g_ms;
 
 	pwm_set_duty(duty);
-  /* USER CODE END 2 */
+	/* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+	/* Infinite loop */
+	/* USER CODE BEGIN WHILE */
 	while (1) {
-    /* USER CODE END WHILE */
+		/* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
+		/* USER CODE BEGIN 3 */
 
 		// Bloque que corre una vez por cada ms
 		if ((uint32_t) (g_ms - h_tick) >= 1U) {
@@ -159,12 +188,9 @@ int main(void)
 			if (evento_larga == 1) {
 				evento_larga = 0;
 				if (modo == MODO_PAUSA) {
-					modo = modo_previo; // no uso cambiar_modo para no reiniciar nada
-					pwm_set_duty(duty);
-					ms_led = 0;
+					salir_pausa();
 				} else {
-					modo_previo = modo;
-					cambiar_modo(MODO_PAUSA);
+					entrar_pausa();
 				}
 			}
 
@@ -205,238 +231,236 @@ int main(void)
 				}
 			}
 		}
+
+		// uart: leer lo que llego y armar lineas
+		uint8_t c;
+		while (rx_leer(&c) == 1) {
+			uint32_t r = armar_linea(c);
+
+			if (r == 1) {
+				procesar_linea();   // linea completa: ejecuta el comando
+			} else if (r == 2) {
+				enviar("ERR OVERFLOW\r\n");
+			}
+		}
 	}
-  /* USER CODE END 3 */
+	/* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
+	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
+	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
+	RCC_PeriphCLKInitTypeDef PeriphClkInit = { 0 };
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-  RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	/** Initializes the RCC Oscillators according to the specified parameters
+	 * in the RCC_OscInitTypeDef structure.
+	 */
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+	RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+	RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+	RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
+	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+		Error_Handler();
+	}
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+	/** Initializes the CPU, AHB and APB buses clocks
+	 */
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_TIM2
-                              |RCC_PERIPHCLK_TIM34;
-  PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
-  PeriphClkInit.Tim2ClockSelection = RCC_TIM2CLK_HCLK;
-  PeriphClkInit.Tim34ClockSelection = RCC_TIM34CLK_HCLK;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
+	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+		Error_Handler();
+	}
+	PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2
+			| RCC_PERIPHCLK_TIM2 | RCC_PERIPHCLK_TIM34;
+	PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
+	PeriphClkInit.Tim2ClockSelection = RCC_TIM2CLK_HCLK;
+	PeriphClkInit.Tim34ClockSelection = RCC_TIM34CLK_HCLK;
+	if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
+		Error_Handler();
+	}
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void) {
 
-  /* USER CODE BEGIN TIM2_Init 0 */
+	/* USER CODE BEGIN TIM2_Init 0 */
 
-  /* USER CODE END TIM2_Init 0 */
+	/* USER CODE END TIM2_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
 
-  /* USER CODE BEGIN TIM2_Init 1 */
+	/* USER CODE BEGIN TIM2_Init 1 */
 
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 71;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 999;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 250;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
+	/* USER CODE END TIM2_Init 1 */
+	htim2.Instance = TIM2;
+	htim2.Init.Prescaler = 71;
+	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim2.Init.Period = 999;
+	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 250;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM2_Init 2 */
 
-  /* USER CODE END TIM2_Init 2 */
-  HAL_TIM_MspPostInit(&htim2);
+	/* USER CODE END TIM2_Init 2 */
+	HAL_TIM_MspPostInit(&htim2);
 
 }
 
 /**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
+ * @brief TIM4 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM4_Init(void) {
 
-  /* USER CODE BEGIN TIM4_Init 0 */
+	/* USER CODE BEGIN TIM4_Init 0 */
 
-  /* USER CODE END TIM4_Init 0 */
+	/* USER CODE END TIM4_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
 
-  /* USER CODE BEGIN TIM4_Init 1 */
+	/* USER CODE BEGIN TIM4_Init 1 */
 
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 71;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 999;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
+	/* USER CODE END TIM4_Init 1 */
+	htim4.Instance = TIM4;
+	htim4.Init.Prescaler = 71;
+	htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim4.Init.Period = 999;
+	htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim4) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM4_Init 2 */
 
-  /* USER CODE END TIM4_Init 2 */
+	/* USER CODE END TIM4_Init 2 */
 
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART2_UART_Init(void) {
 
-  /* USER CODE BEGIN USART2_Init 0 */
+	/* USER CODE BEGIN USART2_Init 0 */
 
-  /* USER CODE END USART2_Init 0 */
+	/* USER CODE END USART2_Init 0 */
 
-  /* USER CODE BEGIN USART2_Init 1 */
+	/* USER CODE BEGIN USART2_Init 1 */
 
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
+	/* USER CODE END USART2_Init 1 */
+	huart2.Instance = USART2;
+	huart2.Init.BaudRate = 115200;
+	huart2.Init.WordLength = UART_WORDLENGTH_8B;
+	huart2.Init.StopBits = UART_STOPBITS_1;
+	huart2.Init.Parity = UART_PARITY_NONE;
+	huart2.Init.Mode = UART_MODE_TX_RX;
+	huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+	huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+	huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+	huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+	if (HAL_UART_Init(&huart2) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN USART2_Init 2 */
 
-  /* USER CODE END USART2_Init 2 */
+	/* USER CODE END USART2_Init 2 */
 
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
+	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+	/* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* USER CODE END MX_GPIO_Init_1 */
+	/* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+	/* GPIO Ports Clock Enable */
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PC13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+	/*Configure GPIO pin : PC13 */
+	GPIO_InitStruct.Pin = GPIO_PIN_13;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	/*Configure GPIO pin : PA5 */
+	GPIO_InitStruct.Pin = GPIO_PIN_5;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+	/* EXTI interrupt init*/
+	HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+	HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+	/* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* USER CODE END MX_GPIO_Init_2 */
+	/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -468,6 +492,19 @@ void cambiar_modo(uint32_t nuevo) {
 	} else {
 		pwm_set_duty(0);
 	}
+}
+
+// Pausa: guarda el modo y apaga el pwm. duty y subiendo no se tocan
+void entrar_pausa(void) {
+	modo_previo = modo;
+	cambiar_modo(MODO_PAUSA);
+}
+
+// Sale de pausa sin reiniciar nada (por eso no uso cambiar_modo)
+void salir_pausa(void) {
+	modo = modo_previo;
+	pwm_set_duty(duty);
+	ms_led = 0;
 }
 
 // ISR del boton
@@ -534,20 +571,246 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 		g_ms = g_ms + 1;
 	}
 }
+
+// ISR de la uart: llego un byte
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART2) {
+		uint32_t siguiente = (rx_head + 1) % RX_TAM;
+
+		if (siguiente == rx_tail) {
+			rx_overflow++;   // buffer lleno, se pierde el byte
+		} else {
+			rx_buf[rx_head] = rx_byte;
+			rx_head = siguiente;
+			rx_total++;
+		}
+		HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   // listo para el siguiente
+	}
+}
+
+// Si la uart tiene un error (por ejemplo overrun)
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART2) {
+		rx_errores++;
+		HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   // volver a escuchar
+	}
+}
+
+// Saca un byte del buffer. Devuelve 1 si habia, 0 si estaba vacio
+uint32_t rx_leer(uint8_t *c) {
+	if (rx_tail == rx_head) {
+		return 0;
+	}
+	*c = rx_buf[rx_tail];
+	rx_tail = (rx_tail + 1) % RX_TAM;
+	return 1;
+}
+
+// Mete un caracter a la linea.
+// Devuelve: 0 = nada, 1 = linea completa, 2 = linea muy larga (overflow)
+uint32_t armar_linea(uint8_t c) {
+	// fin de linea (CR o LF)
+	if (c == '\r' || c == '\n') {
+		if (descartando == 1) {
+			descartando = 0;
+			linea_len = 0;
+			err_overflow++;
+			return 2;
+		}
+		if (linea_len > 0) {
+			linea[linea_len] = '\0';   // cierra el texto
+			linea_len = 0;
+			return 1;
+		}
+		return 0;   // linea vacia: asi CRLF cuenta como una sola orden
+	}
+
+	// caracter normal
+	if (descartando == 1) {
+		return 0;   // la linea se paso, ignoro hasta el fin
+	}
+	if (linea_len < LINEA_MAX) {
+		linea[linea_len] = (char) c;
+		linea_len++;
+	} else {
+		descartando = 1;   // llego el caracter 64
+	}
+	return 0;
+}
+
+// Manda un texto por la uart (por ahora bloqueante, luego lo cambiamos)
+void enviar(const char *texto) {
+	HAL_UART_Transmit(&huart2, (uint8_t*) texto, strlen(texto), 100);
+}
+
+// Revisa que s sea solo digitos y que valga 0..100
+// Devuelve: 0 = bien, 1 = no es un numero limpio, 2 = fuera de rango
+uint32_t leer_numero(const char *s, uint32_t *valor) {
+	if (s[0] == '\0') {
+		return 1;   // vacio
+	}
+
+	uint32_t v = 0;
+	uint32_t muy_grande = 0;
+
+	for (uint32_t i = 0; s[i] != '\0'; i++) {
+		if (s[i] < '0' || s[i] > '9') {
+			return 1;   // letra, signo menos, etc
+		}
+		if (muy_grande == 0) {
+			v = v * 10 + (s[i] - '0');
+			if (v > 100) {
+				muy_grande = 1;   // ya no sigo multiplicando para no desbordar
+			}
+		}
+	}
+
+	if (muy_grande == 1) {
+		return 2;
+	}
+	*valor = v;
+	return 0;
+}
+
+// Ejecuta el comando que esta en linea
+void procesar_linea(void) {
+	// parte la linea en palabras (ignora espacios al inicio y al final)
+	char *cmd = strtok(linea, " \t");
+	char *arg = strtok(NULL, " \t");
+	char *extra = strtok(NULL, " \t");
+
+	if (cmd == NULL) {
+		return;   // solo habia espacios
+	}
+
+	if (strcmp(cmd, "HELP") == 0) {
+		if (arg != NULL) {
+			enviar("ERR ARG\r\n");
+		} else {
+			enviar("HELP, STATUS, MODE MANUAL, MODE AUTO, DUTY n,\r\n");
+			enviar("PAUSE, RESUME, STREAM ON, STREAM OFF\r\n");
+			enviar("OK\r\n");
+		}
+	}
+
+	else if (strcmp(cmd, "STATUS") == 0) {
+		if (arg != NULL) {
+			enviar("ERR ARG\r\n");
+		} else {
+			const char *nombre = "MANUAL";
+			if (modo == MODO_AUTO) {
+				nombre = "AUTO";
+			} else if (modo == MODO_PAUSA) {
+				nombre = "PAUSA";
+			}
+
+			char resp[160];
+			snprintf(resp, sizeof(resp),
+					"MODE=%s FREQ=1000 DUTY=%lu MANUAL=%lu UPTIME=%lu\r\n",
+					nombre, (unsigned long) duty, (unsigned long) duty_manual,
+					(unsigned long) (g_ms / 1000));
+			enviar(resp);
+
+			snprintf(resp, sizeof(resp),
+					"CORTAS=%lu LARGAS=%lu ERR_RX=%lu ERR_OVF_RX=%lu ERR_LINEA=%lu\r\n",
+					(unsigned long) cont_cortas, (unsigned long) cont_largas,
+					(unsigned long) rx_errores, (unsigned long) rx_overflow,
+					(unsigned long) err_overflow);
+			enviar(resp);
+			enviar("OK\r\n");
+		}
+	}
+
+	else if (strcmp(cmd, "MODE") == 0) {
+		if (arg == NULL || extra != NULL) {
+			enviar("ERR ARG\r\n");
+		} else if (modo == MODO_PAUSA) {
+			enviar("ERR STATE\r\n");
+		} else if (strcmp(arg, "MANUAL") == 0) {
+			cambiar_modo(MODO_MANUAL);
+			enviar("OK\r\n");
+		} else if (strcmp(arg, "AUTO") == 0) {
+			cambiar_modo(MODO_AUTO);
+			enviar("OK\r\n");
+		} else {
+			enviar("ERR ARG\r\n");
+		}
+	}
+
+	else if (strcmp(cmd, "DUTY") == 0) {
+		if (modo != MODO_MANUAL) {
+			enviar("ERR STATE\r\n");   // en AUTO y en PAUSA se rechaza
+		} else if (arg == NULL || extra != NULL) {
+			enviar("ERR ARG\r\n");
+		} else {
+			uint32_t n;
+			uint32_t r = leer_numero(arg, &n);
+			if (r == 1) {
+				enviar("ERR ARG\r\n");
+			} else if (r == 2) {
+				enviar("ERR RANGE\r\n");
+			} else {
+				duty_manual = n;   // se guarda y se aplica
+				duty = n;
+				pwm_set_duty(duty);
+				enviar("OK\r\n");
+			}
+		}
+	}
+
+	else if (strcmp(cmd, "PAUSE") == 0) {
+		if (arg != NULL) {
+			enviar("ERR ARG\r\n");
+		} else {
+			if (modo != MODO_PAUSA) {
+				entrar_pausa();   // si ya estaba en pausa no cambia nada
+			}
+			enviar("OK\r\n");
+		}
+	}
+
+	else if (strcmp(cmd, "RESUME") == 0) {
+		if (arg != NULL) {
+			enviar("ERR ARG\r\n");
+		} else if (modo != MODO_PAUSA) {
+			enviar("ERR STATE\r\n");
+		} else {
+			salir_pausa();
+			enviar("OK\r\n");
+		}
+	}
+
+	else if (strcmp(cmd, "STREAM") == 0) {
+		if (arg == NULL || extra != NULL) {
+			enviar("ERR ARG\r\n");
+		} else if (strcmp(arg, "ON") == 0) {
+			stream_activo = 1;
+			enviar("OK\r\n");
+		} else if (strcmp(arg, "OFF") == 0) {
+			stream_activo = 0;
+			enviar("OK\r\n");
+		} else {
+			enviar("ERR ARG\r\n");
+		}
+	}
+
+	else {
+		enviar("ERR COMMAND\r\n");   // incluye FREQ, que no implementamos
+	}
+}
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
+	/* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
 	}
-  /* USER CODE END Error_Handler_Debug */
+	/* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
